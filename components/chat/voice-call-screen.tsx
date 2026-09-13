@@ -88,6 +88,15 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
     const [bgImageResolved, setBgImageResolved] = useState<string | null>(null);
     const [showSttWarning, setShowSttWarning] = useState(false);
 
+    // ── 哄睡功能状态 ──
+    const [showLullabyModal, setShowLullabyModal] = useState(false);
+    const [lullabyPlot, setLullabyPlot] = useState("");
+    const [lullabyLength, setLullabyLength] = useState("800");
+    const [lullabyRunning, setLullabyRunning] = useState(false);
+    const [lullabyAutoHangupMin, setLullabyAutoHangupMin] = useState("30");
+    const lullabyAbortRef = useRef(false);
+    const autoHangupTimerRef = useRef<NodeJS.Timeout | null>(null);
+
     const sttRef = useRef<STTSession | null>(null);
     const audioAbortRef = useRef<(() => void) | null>(null);
     const timerRef = useRef<NodeJS.Timeout | null>(null);
@@ -428,6 +437,100 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
             }
         }
     }, [session, processAIResponse, playCallAudio]);
+
+    // ── 哄睡：按大纲生成长文 → 分段 TTS 朗读 → 写入记忆 ──
+
+    const startLullaby = useCallback(async () => {
+        if (lullabyRunning) return;
+        const voiceConfig = resolveVoiceConfig(session.contactId);
+        if (!voiceConfig) {
+            setSubtitles(prev => [...prev, { id: `lullaby-err-${Date.now()}`, role: "assistant", text: "⚠️ 当前角色未绑定语音音色，无法哄睡" }]);
+            return;
+        }
+
+        setShowLullabyModal(false);
+        setLullabyRunning(true);
+        lullabyAbortRef.current = false;
+
+        // 自动挂断定时器
+        const hangupMin = Math.max(1, parseInt(lullabyAutoHangupMin) || 30);
+        if (autoHangupTimerRef.current) clearTimeout(autoHangupTimerRef.current);
+        autoHangupTimerRef.current = setTimeout(() => {
+            lullabyAbortRef.current = true;
+        }, hangupMin * 60 * 1000);
+
+        const targetLen = Math.max(200, parseInt(lullabyLength) || 800);
+        const plotHint = lullabyPlot.trim() || "温柔地哄对方入睡，可以讲一个舒缓的小故事或者轻声安慰";
+
+        try {
+            setCallState("PROCESSING");
+            setSubtitles(prev => [...prev, { id: `lullaby-start-${Date.now()}`, role: "assistant", text: "🌙 哄睡模式已开启..." }]);
+
+            const lullabyPrompt = `你正在通话中哄对方睡觉。请根据以下大纲/要求，用温柔、舒缓、适合入睡的语气，生成一段约${targetLen}字的哄睡内容。不要输出任何标签、状态栏或内心独白，只输出纯正文。语速放慢，句子之间留有停顿感。\n\n哄睡大纲：${plotHint}`;
+
+            const lullabyUserMsg = pushChatMessage({
+                sessionId: session.id,
+                role: "user",
+                content: `[哄睡模式] ${plotHint}`,
+            });
+            messagesRef.current = [...messagesRef.current, lullabyUserMsg];
+
+            const aiText = flattenCompletionResult(await generateChatCompletion(session, [
+                ...messagesRef.current.slice(-20),
+                { id: `lullaby_sys_${Date.now()}`, sessionId: session.id, role: "user" as const, content: lullabyPrompt, status: "sent" as const, createdAt: new Date().toISOString() },
+            ], { appTags: ["chat", "voice", "lullaby"] }));
+
+            if (stateRef.current === "ENDED" || lullabyAbortRef.current) return;
+
+            // 写入聊天记忆
+            const aiMsg = pushChatMessage({
+                sessionId: session.id,
+                role: "assistant",
+                content: aiText,
+            });
+            messagesRef.current = [...messagesRef.current, aiMsg];
+
+            // 分段朗读（按句号/感叹号/问号/省略号/换行切分）
+            const segments = aiText.split(/(?<=[。！？…\n])\s*/).filter(s => s.trim());
+            setCallState("AI_SPEAKING");
+
+            for (let i = 0; i < segments.length; i++) {
+                if (stateRef.current === "ENDED" || lullabyAbortRef.current) break;
+                const seg = segments[i].trim();
+                if (!seg) continue;
+
+                setSubtitles(prev => [...prev, { id: `lullaby-${Date.now()}-${i}`, role: "assistant", text: seg }]);
+
+                const speechText = stripBilingualForSpeech(seg);
+                try {
+                    const blob = await synthesizeSpeech(speechText, voiceConfig);
+                    if (stateRef.current === "ENDED" || lullabyAbortRef.current) break;
+                    if (blob) {
+                        const { promise, abort } = playCallAudio(blob);
+                        audioAbortRef.current = abort;
+                        await promise;
+                        audioAbortRef.current = null;
+                    }
+                } catch (e) {
+                    console.warn("[Lullaby] TTS segment failed:", e);
+                }
+            }
+
+            if (stateRef.current !== "ENDED") {
+                setSubtitles(prev => [...prev, { id: `lullaby-end-${Date.now()}`, role: "assistant", text: "🌙 哄睡内容已读完，晚安～" }]);
+                setCallState("IDLE");
+            }
+        } catch (error: any) {
+            console.error("[Lullaby] Error:", error);
+            if (stateRef.current !== "ENDED") {
+                setSubtitles(prev => [...prev, { id: `lullaby-err2-${Date.now()}`, role: "assistant", text: `⚠️ 哄睡生成失败: ${error?.message || "未知错误"}` }]);
+                setCallState("IDLE");
+            }
+        } finally {
+            setLullabyRunning(false);
+            if (autoHangupTimerRef.current) { clearTimeout(autoHangupTimerRef.current); autoHangupTimerRef.current = null; }
+        }
+    }, [session, lullabyPlot, lullabyLength, lullabyAutoHangupMin, lullabyRunning, playCallAudio, processAIResponse]);
 
     // ── Auto-listen: 进入 IDLE 自动开始监听 ────────
 
@@ -1007,6 +1110,118 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
                     onClose={() => setShowSttWarning(false)}
                     onNeverShow={handleNeverShowSttWarning}
                 />
+            )}
+
+            {/* 哄睡按钮：通话中且非哄睡运行时显示 */}
+            {callState !== "CONNECTING" && callState !== "ENDED" && !lullabyRunning && (
+                <button
+                    onClick={() => setShowLullabyModal(true)}
+                    style={{
+                        position: "absolute", top: 70, right: 16,
+                        background: "rgba(0,0,0,0.35)", backdropFilter: "blur(8px)",
+                        border: "none", borderRadius: 20, padding: "6px 14px",
+                        color: "#fff", fontSize: "calc(13px*var(--app-text-scale,1))",
+                        cursor: "pointer", zIndex: 10, display: "flex", alignItems: "center", gap: 5,
+                    }}
+                    aria-label="哄睡模式"
+                >
+                    🌙 哄睡
+                </button>
+            )}
+            {lullabyRunning && (
+                <button
+                    onClick={() => { lullabyAbortRef.current = true; if (audioAbortRef.current) audioAbortRef.current(); }}
+                    style={{
+                        position: "absolute", top: 70, right: 16,
+                        background: "rgba(180,60,60,0.7)", backdropFilter: "blur(8px)",
+                        border: "none", borderRadius: 20, padding: "6px 14px",
+                        color: "#fff", fontSize: "calc(13px*var(--app-text-scale,1))",
+                        cursor: "pointer", zIndex: 10,
+                    }}
+                    aria-label="停止哄睡"
+                >
+                    ⏹ 停止哄睡
+                </button>
+            )}
+
+            {/* 哄睡配置弹窗 */}
+            {showLullabyModal && (
+                <div style={{ position: "absolute", inset: 0, zIndex: 100, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    <div onClick={() => setShowLullabyModal(false)} style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.5)" }} />
+                    <div style={{
+                        position: "relative", width: "85%", maxWidth: 340,
+                        background: "var(--c-page-bg, #1a1a2e)", borderRadius: 16,
+                        padding: 20, color: "var(--c-text, #e0e0e0)",
+                        boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
+                    }}>
+                        <div style={{ fontSize: "calc(16px*var(--app-text-scale,1))", fontWeight: 600, marginBottom: 16, display: "flex", alignItems: "center", gap: 8 }}>
+                            🌙 哄睡模式
+                        </div>
+
+                        <label style={{ fontSize: "calc(13px*var(--app-text-scale,1))", opacity: 0.7, display: "block", marginBottom: 4 }}>哄睡大纲 / 想让角色说什么</label>
+                        <textarea
+                            value={lullabyPlot}
+                            onChange={e => setLullabyPlot(e.target.value)}
+                            placeholder="例：讲一个森林里小鹿散步的故事，温柔安静的氛围"
+                            rows={3}
+                            style={{
+                                width: "100%", boxSizing: "border-box", borderRadius: 8,
+                                border: "1px solid rgba(255,255,255,0.15)", background: "rgba(255,255,255,0.08)",
+                                color: "inherit", padding: "8px 10px", fontSize: "calc(13px*var(--app-text-scale,1))",
+                                resize: "vertical",
+                            }}
+                        />
+
+                        <div style={{ display: "flex", gap: 12, marginTop: 12 }}>
+                            <div style={{ flex: 1 }}>
+                                <label style={{ fontSize: "calc(12px*var(--app-text-scale,1))", opacity: 0.7, display: "block", marginBottom: 4 }}>字数</label>
+                                <input
+                                    type="number"
+                                    value={lullabyLength}
+                                    onChange={e => setLullabyLength(e.target.value)}
+                                    min={200} max={10000} step={100}
+                                    style={{
+                                        width: "100%", boxSizing: "border-box", borderRadius: 8,
+                                        border: "1px solid rgba(255,255,255,0.15)", background: "rgba(255,255,255,0.08)",
+                                        color: "inherit", padding: "8px 10px", fontSize: "calc(13px*var(--app-text-scale,1))",
+                                    }}
+                                />
+                            </div>
+                            <div style={{ flex: 1 }}>
+                                <label style={{ fontSize: "calc(12px*var(--app-text-scale,1))", opacity: 0.7, display: "block", marginBottom: 4 }}>自动挂断(分钟)</label>
+                                <input
+                                    type="number"
+                                    value={lullabyAutoHangupMin}
+                                    onChange={e => setLullabyAutoHangupMin(e.target.value)}
+                                    min={1} max={180} step={5}
+                                    style={{
+                                        width: "100%", boxSizing: "border-box", borderRadius: 8,
+                                        border: "1px solid rgba(255,255,255,0.15)", background: "rgba(255,255,255,0.08)",
+                                        color: "inherit", padding: "8px 10px", fontSize: "calc(13px*var(--app-text-scale,1))",
+                                    }}
+                                />
+                            </div>
+                        </div>
+
+                        <div style={{ display: "flex", gap: 10, marginTop: 18 }}>
+                            <button
+                                onClick={() => setShowLullabyModal(false)}
+                                style={{
+                                    flex: 1, padding: "10px 0", borderRadius: 10, border: "1px solid rgba(255,255,255,0.2)",
+                                    background: "transparent", color: "inherit", fontSize: "calc(14px*var(--app-text-scale,1))", cursor: "pointer",
+                                }}
+                            >取消</button>
+                            <button
+                                onClick={startLullaby}
+                                style={{
+                                    flex: 1, padding: "10px 0", borderRadius: 10, border: "none",
+                                    background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
+                                    color: "#fff", fontSize: "calc(14px*var(--app-text-scale,1))", fontWeight: 600, cursor: "pointer",
+                                }}
+                            >🌙 开始哄睡</button>
+                        </div>
+                    </div>
+                </div>
             )}
 
         </div>
