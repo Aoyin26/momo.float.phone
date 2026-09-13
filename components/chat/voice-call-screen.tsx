@@ -115,14 +115,8 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
     useEffect(() => { stateRef.current = callState; }, [callState]);
     useEffect(() => { minimizedRef.current = minimized; }, [minimized]);
 
-    // 缩小为悬浮窗：冻结通话——停止监听、打断在播放的语音
-    useEffect(() => {
-        if (!minimized) return;
-        if (sttRef.current) { sttRef.current.abort(); sttRef.current = null; }
-        setInterimText("");
-        if (audioAbortRef.current) { audioAbortRef.current(); audioAbortRef.current = null; }
-        if (window.speechSynthesis) window.speechSynthesis.cancel();
-    }, [minimized]);
+    // 缩小为悬浮窗：保持通话活跃（麦克风继续监听、TTS 继续播放），仅隐藏全屏 UI
+    // 不再冻结任何音频/识别逻辑，实现真实微信小窗体验
 
     // 来电等待接听：循环振动（开关在聊天主页，iOS 网页不支持自动无效果）
     // + 来电/致电铃声与挂断音（角色专属提示音优先，其余在"全局聊天信息 → 提示音"）
@@ -204,18 +198,7 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
             callStartRef.current = Date.now();
         }
 
-        // 缩小为悬浮窗：冻结计时显示，不再推进
-        if (minimized) {
-            if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
-            if (pausedAtRef.current === null) pausedAtRef.current = Date.now();
-            return;
-        }
-        // 从悬浮窗恢复：把冻结期间流逝的时间补回起点，避免时长跳变
-        if (pausedAtRef.current !== null) {
-            callStartRef.current += Date.now() - pausedAtRef.current;
-            pausedAtRef.current = null;
-        }
-
+        // 小窗模式下计时器也继续推进（通话不冻结）
         timerRef.current = setInterval(() => {
             setCallDuration(Math.floor((Date.now() - callStartRef.current) / 1000));
         }, 1000);
@@ -396,13 +379,7 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
             const subtitleId = `ai-${Date.now()}`;
             setSubtitles(prev => [...prev, { id: subtitleId, role: "assistant", text: displayText }]);
 
-            // 缩小为悬浮窗期间收到的回复：只静默记录文字，不播放语音
-            if (minimizedRef.current) {
-                setCallState("IDLE");
-                return;
-            }
-
-            // 6. TTS
+            // 6. TTS（小窗模式下也继续播放语音，实现真实微信小窗体验）
             setCallState("AI_SPEAKING");
 
             const voiceConfig = resolveVoiceConfig(session.contactId);
@@ -739,17 +716,43 @@ export function VoiceCallScreen({ session, character, onEnd, onConnect, initiato
 
     if (minimized) {
         return (
-            <button
-                type="button"
+            <div
                 className="call-mini-window"
-                style={{ backgroundImage: `url(${bgImageResolved || character.avatar || ""})` }}
-                onClick={onRestore}
+                style={{ backgroundImage: `url(${bgImageResolved || character.avatar || ""})`, cursor: "pointer" }}
                 aria-label={`返回与${character.name}的语音通话`}
                 title="点击返回通话"
             >
                 <span className="call-mini-window-overlay" />
+                <button
+                    type="button"
+                    onClick={onRestore}
+                    style={{ position: "absolute", inset: 0, background: "transparent", border: "none", cursor: "pointer", zIndex: 1 }}
+                    aria-label="恢复全屏通话"
+                />
                 <span className="call-mini-window-name">{character.name}</span>
-            </button>
+                <span style={{
+                    position: "absolute", bottom: 4, left: 0, right: 0,
+                    textAlign: "center", fontSize: 10, color: "#fff", opacity: 0.85,
+                    textShadow: "0 1px 3px rgba(0,0,0,0.6)", zIndex: 2, pointerEvents: "none",
+                }}>
+                    {formatTime(callDuration)}
+                    {callState === "AI_SPEAKING" ? " 🔊" : callState === "PROCESSING" ? " 💭" : ""}
+                </span>
+                <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); handleHangup(); }}
+                    style={{
+                        position: "absolute", top: -6, right: -6, zIndex: 3,
+                        width: 22, height: 22, borderRadius: "50%",
+                        background: "#e53e3e", border: "2px solid #fff",
+                        display: "flex", alignItems: "center", justifyContent: "center",
+                        cursor: "pointer", padding: 0, lineHeight: 1,
+                    }}
+                    aria-label="挂断"
+                >
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+                </button>
+            </div>
         );
     }
 
